@@ -20,8 +20,8 @@ python3 -m unittest discover -s tests -p 'test_*.py'
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
-for t in dm_pages_test dm_index_test file_lock_test zero_test cookies_test; do
-    cc -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+for t in dm_pages_test dm_index_test file_lock_test zero_test cookies_test vfile_test; do
+    cc -std=gnu11 -Wall -Wextra -Werror -fsanitize=address,undefined -pthread \
         -o "$tmp/$t" "radv/android_probe/$t.c"
     "$tmp/$t" > /dev/null
     echo "$t: ok"

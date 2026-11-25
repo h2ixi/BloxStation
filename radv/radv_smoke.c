@@ -2928,7 +2928,7 @@ roblox_fps_monitor(void *arg)
       report("roblox: fps %.1f (frames %u, %u%% of the time in present; freezes: %u over 50 ms, %u over 250 ms, "
              "longest %llu ms; direct memory: %llu maps (%llu reused, %llu cached), "
              "%llu unmaps, %llu frees, %llu ms; zeroed %llu MiB in %llu ms; hole search %llu ms, cache %llu ms, unmap %llu ms; "
-             "log: %llu lines written, %llu dropped)",
+             "log: %llu lines written, %llu dropped; failed maps %llu in %llu ms)",
              d / 10.0, n, (unsigned)((pns - last_ns) / 100000000ull), g50, g250, (unsigned long long)(gmax / 1000000), (unsigned long long)(dm[0] - dm_last[0]),
              (unsigned long long)(dm[4] - dm_last[4]), (unsigned long long)(dm[5] - dm_last[5]),
              (unsigned long long)(dm[1] - dm_last[1]), (unsigned long long)(dm[2] - dm_last[2]),
@@ -2936,8 +2936,24 @@ roblox_fps_monitor(void *arg)
              (unsigned long long)(dm[7] - dm_last[7]), (unsigned long long)(dm[8] - dm_last[8]),
              (unsigned long long)(dm[9] - dm_last[9]), (unsigned long long)(dm[10] - dm_last[10]),
              (unsigned long long)__atomic_load_n(&report_written, __ATOMIC_RELAXED),
-             (unsigned long long)__atomic_load_n(&report_dropped, __ATOMIC_RELAXED));
+             (unsigned long long)__atomic_load_n(&report_dropped, __ATOMIC_RELAXED),
+             (unsigned long long)__atomic_load_n(&bionic_mmap_fails, __ATOMIC_RELAXED),
+             (unsigned long long)(__atomic_load_n(&bionic_mmap_fail_ns, __ATOMIC_RELAXED) / 1000000));
       memcpy(dm_last, dm, sizeof(dm));
+      {
+         uint64_t calls, total, slowest;
+         const char *kind;
+         bionic_fio_stats(&calls, &total, &slowest, &kind);
+         uint64_t kept, spilled, written_out;
+         size_t live;
+         vf_stats(&kept, &spilled, &written_out, &live);
+         if (calls)
+            report("roblox: files: %llu calls in %llu ms, slowest %llu ms (%s); spill files in memory %llu "
+                   "(%zu KiB live), to storage %llu, written out %llu",
+                   (unsigned long long)calls, (unsigned long long)(total / 1000000),
+                   (unsigned long long)(slowest / 1000000), kind, (unsigned long long)kept, live >> 10,
+                   (unsigned long long)spilled, (unsigned long long)written_out);
+      }
       if (++windows % 6 == 0) {
          uint64_t w[5];
          bionic_dm_waste(w);

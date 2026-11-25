@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include "bionic_vfile.h"
 
 /* ---- direct imports ------------------------------------------------------
  * Declared with assembler labels so no prototype here conflicts with the
@@ -48,16 +49,14 @@
    X(atof) X(atoi) X(atol) X(atoll) X(strtod) X(strtof) X(strtol) X(strtoll) X(strtoul)            \
    X(strtoull) X(bsearch) X(qsort) X(ldiv) X(rand) X(srand)                                        \
    X(malloc) X(calloc) X(realloc) X(free)                                                          \
-   X(fgets) X(fputc) X(fputs) X(fread) X(fprintf)           \
-   X(vfprintf) X(printf) X(puts) X(snprintf) X(vsnprintf) X(sscanf) X(vsscanf) X(fscanf)           \
-   X(vasprintf) X(setvbuf) X(fseek) X(ftell) X(feof) X(ferror) X(clearerr) X(fileno) X(getc)       \
-   X(ungetc) X(fdopen) X(fseeko) X(ftello)                                     \
+   X(printf) X(puts) X(snprintf) X(vsnprintf) X(sscanf) X(vsscanf) X(fscanf)                       \
+   X(vasprintf) X(fileno) X(ungetc) X(fdopen)                                                      \
    X(time) X(difftime) X(gmtime) X(gmtime_r) X(localtime) X(localtime_r) X(mktime) X(strftime)     \
    X(gettimeofday) X(nanosleep) X(getenv) X(strerror) X(sched_yield)                      \
    X(pthread_self) X(pthread_equal) X(pthread_detach) X(pthread_join)              \
    X(pthread_key_create) X(pthread_key_delete) X(pthread_getspecific) X(pthread_setspecific)       \
    X(getpid) X(getuid) X(geteuid)                            \
-   X(isatty) X(usleep) X(fsync) X(ftruncate)
+   X(isatty) X(usleep) X(fsync)
 
 #define BIONIC_DECLARE_DIRECT(name) extern char bionic_direct_##name[] __asm__(#name);
 BIONIC_DIRECT_LIST(BIONIC_DECLARE_DIRECT)
@@ -1249,7 +1248,9 @@ bionic_dm_map(size_t len, int prot)
       const char *e = getenv("ROBLOX_DMEM_MB");
       bionic_dm_cap = (size_t)(e ? atoi(e) : 8192) << 20;
    }
-   if (len >= (256u << 20))
+   /* Up to 768 MiB; the caller sends 256 MiB and more only for maps the engine
+    * will use (not bare reservations, see bionic_mmap) */
+   if (len > (768u << 20))
       return MAP_FAILED;
    const uint64_t t0 = bionic_dm_ns();
    int hole_changed = 0;
@@ -1582,10 +1583,28 @@ bionic_msync(void *a, size_t n, int flags)
 }
 
 /* ---- memory: Linux mmap flags to the system's ------------------------------ */
+/* failed anonymous maps (count, time in the failing system calls): the
+ * engine retries a 256 MiB reservation many times while a game loads */
+static uint64_t bionic_mmap_fails, bionic_mmap_fail_ns;
 
 static void *
 bionic_mmap(void *addr, size_t len, int prot, int linux_flags, int fd, long off)
 {
+   /* a spill file kept in memory (bionic_vfile.h), mapped to be read: a copy */
+   if (fd >= 0 && !(linux_flags & 0x30) && len) {
+      const int h = vf_find_fd(fd);
+      if (h >= 0) {
+         void *c = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+         if (c == MAP_FAILED)
+            c = bionic_dm_map(len, PROT_READ | PROT_WRITE);
+         if (c == MAP_FAILED)
+            return c;
+         vf_pread(h, off, c, len);
+         if ((prot & 3) != 3)
+            mprotect(c, len, prot & 3);
+         return c;
+      }
+   }
    int flags = 0;
    if (linux_flags & 0x01) flags |= MAP_SHARED;
    if (linux_flags & 0x02) flags |= MAP_PRIVATE;
@@ -1623,6 +1642,7 @@ bionic_mmap(void *addr, size_t len, int prot, int linux_flags, int fd, long off)
             bionic_say("MEMORY: %zu MiB flexible left: %zu bytes from direct memory instead", avail >> 20, len);
       }
    }
+   const uint64_t t_map = bionic_dm_ns();
    if (p == MAP_FAILED)
 #endif
       p = mmap(addr, len, prot & 7, flags, (linux_flags & 0x20) ? -1 : fd, off);
@@ -1633,12 +1653,25 @@ bionic_mmap(void *addr, size_t len, int prot, int linux_flags, int fd, long off)
    if (p == MAP_FAILED && errno == EACCES && len <= (1u << 20) && (linux_flags & 0x01) && !(linux_flags & 0x20) && fd >= 0 &&
        (prot & PROT_WRITE))
       p = bionic_fmap_emulate(addr, len, prot, linux_flags & 0x10, fd, off);
-   if (p == MAP_FAILED && errno == ENOMEM && (linux_flags & 0x20) && !(linux_flags & 0x10))
+   /* Flexible memory exhausted: direct memory instead. From 256 MiB up only
+    * for maps with access (the allocator's huge objects, "commit: 1"): when
+    * one 256 MiB + 64 KiB block was refused, the engine's allocator failed
+    * ("unable to allocate OS memory") and the game stopped drawing for good.
+    * Bare reservations (PROT_NONE, like 1 GiB arenas) still get no direct
+    * memory. */
+   if (p == MAP_FAILED && errno == ENOMEM && (linux_flags & 0x20) && !(linux_flags & 0x10) &&
+       (len < (256u << 20) || (prot & 3)))
       p = bionic_dm_map(len, prot);
    static unsigned said, failed;
    static size_t total;
    if (p != MAP_FAILED)
       total += len;
+#if defined(__PROSPERO__)
+   else if (linux_flags & 0x20) {
+      __atomic_add_fetch(&bionic_mmap_fails, 1, __ATOMIC_RELAXED);
+      __atomic_add_fetch(&bionic_mmap_fail_ns, bionic_dm_ns() - t_map, __ATOMIC_RELAXED);
+   }
+#endif
    if (p == MAP_FAILED && len != 1073807360) {
       if (failed++ < 40)
          bionic_say("MEMORY: a map of %zu bytes (prot %d, flags 0x%x, fd %d, offset %ld) FAILED, errno %d (mapped so far ~%zu MiB, direct %zu MiB)",
@@ -1937,8 +1970,85 @@ static void bionic_arc4random_buf(void *buf, size_t n) { bionic_getentropy(buf, 
 
 /* ---- _FORTIFY_SOURCE entry points ----------------------------------------- */
 
-static size_t bionic_fread_chk(void *buf, size_t bufsz, size_t size, size_t count, FILE *f) { (void)bufsz; return fread(buf, size, count, f); }
-static size_t bionic_fwrite_chk(const void *buf, size_t bufsz, size_t size, size_t count, FILE *f) { (void)bufsz; return fwrite(buf, size, count, f); }
+/* stdio on the engine's spill files kept in memory (bionic_vfile.h); every
+ * other FILE goes straight to the system's stdio */
+static size_t
+bionic_fread(void *buf, size_t size, size_t count, FILE *f)
+{
+   const int h = vf_find(f);
+   if (h < 0)
+      return fread(buf, size, count, f);
+   return size && count ? vf_read(h, buf, size * count) / size : 0;
+}
+static int bionic_fseek(FILE *f, long off, int whence) { const int h = vf_find(f); return h < 0 ? fseek(f, off, whence) : vf_seek(h, off, whence); }
+static int bionic_fseeko(FILE *f, off_t off, int whence) { const int h = vf_find(f); return h < 0 ? fseeko(f, off, whence) : vf_seek(h, off, whence); }
+static long bionic_ftell(FILE *f) { const int h = vf_find(f); return h < 0 ? ftell(f) : (long)vf_tell(h); }
+static off_t bionic_ftello(FILE *f) { const int h = vf_find(f); return h < 0 ? ftello(f) : (off_t)vf_tell(h); }
+static int bionic_feof(FILE *f) { const int h = vf_find(f); return h < 0 ? feof(f) : vf_eof(h); }
+static int bionic_ferror(FILE *f) { const int h = vf_find(f); return h < 0 ? ferror(f) : vf_error(h); }
+static void bionic_clearerr(FILE *f) { const int h = vf_find(f); if (h < 0) clearerr(f); else vf_clearerr(h); }
+static int bionic_getc(FILE *f) { const int h = vf_find(f); return h < 0 ? getc(f) : vf_getc(h); }
+static char *bionic_fgets(char *s, int n, FILE *f) { const int h = vf_find(f); return h < 0 ? fgets(s, n, f) : vf_gets(h, s, n); }
+static int
+bionic_fputc(int c, FILE *f)
+{
+   const int h = vf_find(f);
+   if (h < 0)
+      return fputc(c, f);
+   const unsigned char b = (unsigned char)c;
+   return vf_write(h, &b, 1) == 1 ? b : EOF;
+}
+static int
+bionic_fputs(const char *str, FILE *f)
+{
+   const int h = vf_find(f);
+   if (h < 0)
+      return fputs(str, f);
+   const size_t n = strlen(str);
+   return vf_write(h, str, n) == n ? 1 : EOF;
+}
+static int
+bionic_vfprintf(FILE *f, const char *fmt, va_list ap)
+{
+   const int h = vf_find(f);
+   if (h < 0)
+      return vfprintf(f, fmt, ap);
+   char small[512];
+   va_list aq;
+   va_copy(aq, ap);
+   const int n = vsnprintf(small, sizeof(small), fmt, aq);
+   va_end(aq);
+   if (n < 0)
+      return n;
+   char *b = (size_t)n < sizeof(small) ? small : malloc((size_t)n + 1);
+   if (!b)
+      return -1;
+   if (b != small)
+      vsnprintf(b, (size_t)n + 1, fmt, ap);
+   const size_t w = vf_write(h, b, (size_t)n);
+   if (b != small)
+      free(b);
+   return w == (size_t)n ? n : -1;
+}
+static int
+bionic_fprintf(FILE *f, const char *fmt, ...)
+{
+   va_list ap;
+   va_start(ap, fmt);
+   const int r = bionic_vfprintf(f, fmt, ap);
+   va_end(ap);
+   return r;
+}
+static int bionic_setvbuf(FILE *f, char *b, int mode, size_t n) { return vf_find(f) >= 0 ? 0 : setvbuf(f, b, mode, n); }
+static int
+bionic_ftruncate(int fd, off_t len)
+{
+   const int h = vf_find_fd(fd);
+   return h < 0 ? ftruncate(fd, len) : vf_truncate_fd(h, len);
+}
+static size_t bionic_fwrite(const void *buf, size_t size, size_t count, FILE *f);
+static size_t bionic_fread_chk(void *buf, size_t bufsz, size_t size, size_t count, FILE *f) { (void)bufsz; return bionic_fread(buf, size, count, f); }
+static size_t bionic_fwrite_chk(const void *buf, size_t bufsz, size_t size, size_t count, FILE *f) { (void)bufsz; return bionic_fwrite(buf, size, count, f); }
 static int bionic_vsnprintf_chk(char *b, size_t n, int flags, size_t bn, const char *fmt, va_list ap) { (void)flags; (void)bn; return vsnprintf(b, n, fmt, ap); }
 static int bionic_vsprintf_chk(char *b, int flags, size_t bn, const char *fmt, va_list ap) { (void)flags; return vsnprintf(b, bn, fmt, ap); }
 static char *bionic_strncpy_chk2(char *d, const char *s, size_t n, size_t dn, size_t sn) { (void)dn; (void)sn; return strncpy(d, s, n); }
@@ -2451,6 +2561,19 @@ static int
 bionic_stat_fn(const char *path, struct bionic_stat *out)
 {
    BIONIC_PATH(path);
+   {
+      int64_t size;
+      if (vf_stat(path, &size)) {
+         memset(out, 0, sizeof(*out));
+         out->st_mode = 0100644;
+         out->st_nlink = 1;
+         out->st_size = size;
+         out->st_blksize = 16384;
+         out->st_blocks = (size + 511) / 512;
+         out->st_atime_s = out->st_mtime_s = out->st_ctime_s = (int64_t)time(NULL);
+         return 0;
+      }
+   }
    if (bionic_path_absent(path)) {
       errno = ENOENT;
       return -1;
@@ -2466,6 +2589,18 @@ bionic_stat_fn(const char *path, struct bionic_stat *out)
 static int
 bionic_fstat_fn(int fd, struct bionic_stat *out)
 {
+   {
+      const int h = vf_find_fd(fd);
+      if (h >= 0) {
+         memset(out, 0, sizeof(*out));
+         out->st_mode = 0100644;
+         out->st_nlink = 1;
+         out->st_size = vf_size_fd(h);
+         out->st_blksize = 16384;
+         out->st_blocks = (out->st_size + 511) / 512;
+         return 0;
+      }
+   }
    if ((fd >= BIONIC_PROC_BASE_FD && fd < BIONIC_PROC_BASE_FD + BIONIC_PROC_FDS) || fd == BIONIC_URANDOM_FD) {
       /* as Linux reports them: /proc files are size-0 regular files,
        * urandom a character device */
@@ -2569,6 +2704,8 @@ static FILE *bionic_unflushed[8];
 static int
 bionic_fflush(FILE *f)
 {
+   if (vf_find(f) >= 0)
+      return 0;
    if (f)
       for (int i = 0; i < 8; i++)
          if (__atomic_load_n(&bionic_unflushed[i], __ATOMIC_ACQUIRE) == f)
@@ -2579,6 +2716,11 @@ bionic_fflush(FILE *f)
 static int
 bionic_fclose(FILE *f)
 {
+   {
+      const int h = vf_find(f);
+      if (h >= 0)
+         return vf_close(h);
+   }
    for (int i = 0; i < 8; i++)
       if (__atomic_load_n(&bionic_unflushed[i], __ATOMIC_ACQUIRE) == f)
          __atomic_store_n(&bionic_unflushed[i], (FILE *)NULL, __ATOMIC_RELEASE);
@@ -2591,6 +2733,11 @@ static FILE *
 bionic_fopen(const char *path, const char *mode)
 {
    BIONIC_PATH(path);
+   {
+      FILE *v = vf_open(path, mode);
+      if (v)
+         return v;
+   }
    {
       char real[160];
       const char *sp = bionic_selfproc(path, real, sizeof(real));
@@ -2626,6 +2773,11 @@ bionic_fopen(const char *path, const char *mode)
 static size_t
 bionic_fwrite(const void *buf, size_t size, size_t count, FILE *f)
 {
+   {
+      const int h = vf_find(f);
+      if (h >= 0)
+         return size && count ? vf_write(h, buf, size * count) / size : 0;
+   }
    bool echo = f == stdout || f == stderr;
    for (int i = 0; i < 16; i++)
       if (bionic_written[i] && bionic_written[i] == f)
@@ -2666,10 +2818,10 @@ static int bionic_ANativeWindow_getWidth(struct bionic_window *w) { return w ? w
 static int bionic_ANativeWindow_getHeight(struct bionic_window *w) { return w ? w->height : 0; }
 
 static int bionic_access(const char *path, int mode) { BIONIC_PATH(path); return access(path, mode); }
-static int bionic_remove(const char *path) { BIONIC_PATH(path); return remove(path); }
+static int bionic_remove(const char *path) { BIONIC_PATH(path); if (vf_unlink(path)) return 0; return remove(path); }
 static int bionic_rmdir(const char *path) { BIONIC_PATH(path); return rmdir(path); }
-static int bionic_unlink(const char *path) { BIONIC_PATH(path); return unlink(path); }
-static int bionic_rename(const char *a, const char *b) { BIONIC_PATH(a); BIONIC_PATH(b); return rename(a, b); }
+static int bionic_unlink(const char *path) { BIONIC_PATH(path); if (vf_unlink(path)) return 0; return unlink(path); }
+static int bionic_rename(const char *a, const char *b) { BIONIC_PATH(a); BIONIC_PATH(b); int r; if (vf_rename(a, b, &r)) return r; return rename(a, b); }
 
 /* ---- system information ------------------------------------------------------ */
 
@@ -3449,6 +3601,88 @@ bionic_wcsxfrm(bionic_wchar *dst, const bionic_wchar *src, size_t n)
    return len;
 }
 
+/* ---- file-operation timing ------------------------------------------------
+ * How long the engine's file calls take on the PS5's storage (asset cache,
+ * settings, logs), per kind: count, total and slowest since the last read
+ * (bionic_fio_stats, printed by the title every 10 s). */
+enum { FIO_OPEN, FIO_STAT, FIO_CLOSE, FIO_UNLINK, FIO_RENAME, FIO_MKDIR, FIO_FOPEN, FIO_FWRITE, FIO_FCLOSE, FIO_N };
+static const char *const bionic_fio_names[FIO_N] = {"open", "stat", "close", "unlink", "rename", "mkdir", "fopen", "fwrite", "fclose"};
+static uint64_t bionic_fio_count[FIO_N], bionic_fio_ns[FIO_N], bionic_fio_max[FIO_N];
+static void
+bionic_fio_add(int k, uint64_t t0)
+{
+   const uint64_t d = bionic_dm_ns() - t0;
+   __atomic_add_fetch(&bionic_fio_count[k], 1, __ATOMIC_RELAXED);
+   __atomic_add_fetch(&bionic_fio_ns[k], d, __ATOMIC_RELAXED);
+   uint64_t m = __atomic_load_n(&bionic_fio_max[k], __ATOMIC_RELAXED);
+   while (d > m && !__atomic_compare_exchange_n(&bionic_fio_max[k], &m, d, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
+      ;
+}
+/* calls, total ns, slowest ns and its kind since the last call; resets */
+static void
+bionic_fio_stats(uint64_t *calls, uint64_t *total, uint64_t *slowest, const char **kind)
+{
+   *calls = *total = *slowest = 0;
+   *kind = "";
+   for (int k = 0; k < FIO_N; k++) {
+      *calls += __atomic_exchange_n(&bionic_fio_count[k], 0, __ATOMIC_RELAXED);
+      *total += __atomic_exchange_n(&bionic_fio_ns[k], 0, __ATOMIC_RELAXED);
+      const uint64_t m = __atomic_exchange_n(&bionic_fio_max[k], 0, __ATOMIC_RELAXED);
+      if (m > *slowest) {
+         *slowest = m;
+         *kind = bionic_fio_names[k];
+      }
+   }
+}
+/* the slow ones (over 20 ms), by folder: the first 60 are reported */
+static void
+bionic_fio_slow(int kind, const char *path, uint64_t t0)
+{
+   const uint64_t d = bionic_dm_ns() - t0;
+   static unsigned said;
+   if (d < 20000000ull || !path || __atomic_add_fetch(&said, 1, __ATOMIC_RELAXED) > 60)
+      return;
+   char dir[120];
+   snprintf(dir, sizeof(dir), "%s", path);
+   char *slash = strrchr(dir, '/');
+   if (slash)
+      *slash = 0;
+   bionic_say("files: slow %s in %s: %llu ms", bionic_fio_names[kind], dir, (unsigned long long)(d / 1000000));
+}
+#define BIONIC_TIMED_PATH(kind, path, call)                                                                 \
+   do {                                                                                                    \
+      const uint64_t t0_ = bionic_dm_ns();                                                                 \
+      __typeof__(call) r_ = (call);                                                                        \
+      bionic_fio_add(kind, t0_);                                                                           \
+      bionic_fio_slow(kind, path, t0_);                                                                    \
+      return r_;                                                                                           \
+   } while (0)
+#define BIONIC_TIMED(kind, call)                                                                            \
+   do {                                                                                                    \
+      const uint64_t t0_ = bionic_dm_ns();                                                                 \
+      __typeof__(call) r_ = (call);                                                                        \
+      bionic_fio_add(kind, t0_);                                                                           \
+      return r_;                                                                                           \
+   } while (0)
+static int
+bionic_t_open(const char *path, int flags, ...)
+{
+   va_list ap;
+   va_start(ap, flags);
+   const int mode = va_arg(ap, int);
+   va_end(ap);
+   BIONIC_TIMED_PATH(FIO_OPEN, path, bionic_open(path, flags, mode));
+}
+static int bionic_t_stat(const char *p, struct bionic_stat *o) { BIONIC_TIMED_PATH(FIO_STAT, p, bionic_stat_fn(p, o)); }
+static int bionic_t_close(int fd) { BIONIC_TIMED(FIO_CLOSE, bionic_close(fd)); }
+static int bionic_t_unlink(const char *p) { BIONIC_TIMED_PATH(FIO_UNLINK, p, bionic_unlink(p)); }
+static int bionic_t_remove(const char *p) { BIONIC_TIMED(FIO_UNLINK, bionic_remove(p)); }
+static int bionic_t_rename(const char *a, const char *b) { BIONIC_TIMED_PATH(FIO_RENAME, a, bionic_rename(a, b)); }
+static int bionic_t_mkdir(const char *p, int m) { BIONIC_TIMED(FIO_MKDIR, bionic_mkdir(p, m)); }
+static FILE *bionic_t_fopen(const char *p, const char *m) { BIONIC_TIMED_PATH(FIO_FOPEN, p, bionic_fopen(p, m)); }
+static size_t bionic_t_fwrite(const void *b, size_t s, size_t n, FILE *f) { BIONIC_TIMED(FIO_FWRITE, bionic_fwrite(b, s, n, f)); }
+static int bionic_t_fclose(FILE *f) { BIONIC_TIMED(FIO_FCLOSE, bionic_fclose(f)); }
+
 static const struct ael_import bionic_imports[] = {
    BIONIC_DIRECT_LIST(BIONIC_DIRECT_ENTRY)
    {"__android_log_print", (void *)bionic_log_print},
@@ -3581,9 +3815,9 @@ static const struct ael_import bionic_imports[] = {
    {"dlsym", (void *)bionic_dlsym},
    {"dlclose", (void *)bionic_dlclose},
    {"dladdr", (void *)bionic_dladdr},
-   {"open", (void *)bionic_open},
+   {"open", (void *)bionic_t_open},
    {"__open_2", (void *)bionic_open_2},
-   {"stat", (void *)bionic_stat_fn},
+   {"stat", (void *)bionic_t_stat},
    {"lstat", (void *)bionic_stat_fn},
    {"fstat", (void *)bionic_fstat_fn},
    {"readlink", (void *)bionic_readlink},
@@ -3604,7 +3838,7 @@ static const struct ael_import bionic_imports[] = {
    {"mbsnrtowcs", (void *)bionic_mbsnrtowcs},
    {"wcsnrtombs", (void *)bionic_wcsnrtombs},
    {"read", (void *)bionic_read},
-   {"close", (void *)bionic_close},
+   {"close", (void *)bionic_t_close},
    {"strerror_r", (void *)bionic_strerror_r},
    {"openlog", (void *)bionic_openlog},
    {"syslog", (void *)bionic_syslog},
@@ -3637,18 +3871,34 @@ static const struct ael_import bionic_imports[] = {
    {"exit", (void *)bionic_exit},
    {"getcwd", (void *)bionic_getcwd},
    {"access", (void *)bionic_access},
-   {"remove", (void *)bionic_remove},
-   {"rename", (void *)bionic_rename},
+   {"remove", (void *)bionic_t_remove},
+   {"rename", (void *)bionic_t_rename},
    {"rmdir", (void *)bionic_rmdir},
-   {"unlink", (void *)bionic_unlink},
-   {"fopen", (void *)bionic_fopen},
-   {"fwrite", (void *)bionic_fwrite},
+   {"unlink", (void *)bionic_t_unlink},
+   {"fopen", (void *)bionic_t_fopen},
+   {"fwrite", (void *)bionic_t_fwrite},
    {"fflush", (void *)bionic_fflush},
-   {"fclose", (void *)bionic_fclose},
+   {"fread", (void *)bionic_fread},
+   {"fseek", (void *)bionic_fseek},
+   {"fseeko", (void *)bionic_fseeko},
+   {"ftell", (void *)bionic_ftell},
+   {"ftello", (void *)bionic_ftello},
+   {"feof", (void *)bionic_feof},
+   {"ferror", (void *)bionic_ferror},
+   {"clearerr", (void *)bionic_clearerr},
+   {"getc", (void *)bionic_getc},
+   {"fgets", (void *)bionic_fgets},
+   {"fputc", (void *)bionic_fputc},
+   {"fputs", (void *)bionic_fputs},
+   {"fprintf", (void *)bionic_fprintf},
+   {"vfprintf", (void *)bionic_vfprintf},
+   {"setvbuf", (void *)bionic_setvbuf},
+   {"ftruncate", (void *)bionic_ftruncate},
+   {"fclose", (void *)bionic_t_fclose},
    {"opendir", (void *)bionic_opendir},
    {"readdir", (void *)bionic_readdir},
    {"closedir", (void *)bionic_closedir},
-   {"mkdir", (void *)bionic_mkdir},
+   {"mkdir", (void *)bionic_t_mkdir},
    {"realpath", (void *)bionic_realpath},
    {"_exit", (void *)bionic__exit},
    {"_Exit", (void *)bionic__exit},
