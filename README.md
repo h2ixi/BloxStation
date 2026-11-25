@@ -33,7 +33,7 @@ explains. Nothing needs building.
 | Built-in network tunnel (Cloudflare WARP) for networks that block Roblox | works |
 | Each console registers its own tunnel identity on first launch | works |
 | Tunnel finds a reachable server by itself (378 address/port pairs) and remembers it | works |
-| Game traffic over UDP goes through the tunnel | no: UDP uses the normal network |
+| Game traffic over UDP goes through the tunnel (fixes error 279 where game servers are blocked) | works |
 | Countries that block WireGuard itself (deep packet inspection) | no |
 | Circle going back one page inside a web page | no: it closes the page |
 | Other Roblox versions than 2.746.1266 | no |

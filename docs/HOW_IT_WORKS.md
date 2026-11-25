@@ -57,5 +57,11 @@ on the local network do not apply. Names are looked up through the tunnel.
   through the tunnel and adds the signed-in cookies. It turns `roblox://` links
   (Join, profiles) into actions in the engine.
 
-Limits: UDP (game traffic) still uses the normal network. Networks that
-detect and block WireGuard itself block every server.
+- **Game traffic** (`bionic_net.h`, `warp_gateway.c`): Roblox's game servers
+  speak UDP. A game socket's first datagram to a public address opens a
+  SOCKS5 UDP association with the gateway; every datagram then goes through
+  the tunnel, and replies come back to the same socket, so the engine sees
+  the real server. LAN traffic stays direct. Without this, networks that
+  block Roblox's game servers end every join with error 279.
+
+Limits: networks that detect and block WireGuard itself block every server.

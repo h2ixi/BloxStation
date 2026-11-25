@@ -284,7 +284,7 @@ uplink_receive(void)
 
 /* ---- SOCKS5 connections bridged to lwIP TCP ----------------------------- */
 
-enum { C_FREE, C_GREET, C_REQUEST, C_WAIT_TUNNEL, C_RESOLVING, C_CONNECTING, C_OPEN };
+enum { C_FREE, C_GREET, C_REQUEST, C_WAIT_TUNNEL, C_RESOLVING, C_CONNECTING, C_OPEN, C_UDP };
 #define MAX_CONNS 192
 struct conn {
    int state;
@@ -300,6 +300,7 @@ struct conn {
    int local_eof;        /* the title finished sending */
    u32_t since;          /* C_WAIT_TUNNEL: when it started waiting */
    int dns_tries;        /* name lookups that timed out so far */
+   int udp;              /* C_UDP: its association, index + 1 */
 };
 static struct conn conns[MAX_CONNS];
 static unsigned n_opened, n_failed;
@@ -316,9 +317,12 @@ set_nonblock(int fd)
 #endif
 }
 
+static void udp_assoc_free(int index);
 static void
 conn_close(struct conn *c)
 {
+   if (c->udp)
+      udp_assoc_free(c->udp - 1);
    if (c->pcb) {
       tcp_arg(c->pcb, NULL);
       tcp_recv(c->pcb, NULL);
@@ -340,12 +344,17 @@ conn_close(struct conn *c)
 }
 
 static void
-socks_reply(struct conn *c, uint8_t status, uint32_t addr /* network order */)
+socks_reply_port(struct conn *c, uint8_t status, uint32_t addr /* network order */, uint16_t port /* host order */)
 {
    uint8_t r[10] = {5, status, 0, 1};
    memcpy(r + 4, &addr, 4);
-   r[8] = 0, r[9] = 0;
+   r[8] = (uint8_t)(port >> 8), r[9] = (uint8_t)port;
    (void)!write(c->fd, r, sizeof(r));
+}
+static void
+socks_reply(struct conn *c, uint8_t status, uint32_t addr /* network order */)
+{
+   socks_reply_port(c, status, addr, 0);
 }
 
 static err_t
@@ -480,6 +489,148 @@ socks_go(struct conn *c)
    }
 }
 
+/* ---- SOCKS5 UDP ASSOCIATE: the game's own traffic ---------------------
+ * Roblox's game servers speak UDP. It used to go straight out of the PS5,
+ * and some networks (Qatar, Nov 25) stopped answering it: every join ended
+ * in "no response from server" (error 279). An association is a relay
+ * socket on 127.0.0.1 and an lwIP UDP socket inside the tunnel; datagrams
+ * carry the SOCKS5 UDP header (RFC 1928 section 7) on the relay side. It
+ * lives as long as its SOCKS control connection. */
+#define MAX_UDP 64
+struct uassoc {
+   int used;
+   int fd;              /* relay socket, 127.0.0.1 */
+   struct udp_pcb *pcb; /* inside the tunnel */
+   struct sockaddr_in client;
+   int have_client;
+};
+static struct uassoc uas[MAX_UDP];
+static unsigned long long n_udp_out, n_udp_in, n_udp_drop, n_udp_assoc;
+static uint8_t udp_buf[10 + 65536];
+
+static void
+udp_assoc_free(int i)
+{
+   struct uassoc *u = &uas[i];
+   if (!u->used)
+      return;
+   if (u->pcb)
+      udp_remove(u->pcb);
+   if (u->fd >= 0)
+      close(u->fd);
+   memset(u, 0, sizeof(*u));
+   u->fd = -1;
+}
+
+/* tunnel -> title */
+static void
+udp_from_tunnel(void *arg, struct udp_pcb *pcb, struct pbuf *p, const ip_addr_t *addr, u16_t port)
+{
+   (void)pcb;
+   struct uassoc *u = arg;
+   if (!u || !u->used || !u->have_client) { /* tot_len (u16) always fits udp_buf */
+      n_udp_drop++;
+      pbuf_free(p);
+      return;
+   }
+   const uint32_t a = ip4_addr_get_u32(ip_2_ip4(addr));
+   udp_buf[0] = udp_buf[1] = udp_buf[2] = 0;
+   udp_buf[3] = 1;
+   memcpy(udp_buf + 4, &a, 4);
+   udp_buf[8] = (uint8_t)(port >> 8), udp_buf[9] = (uint8_t)port;
+   const u16_t n = pbuf_copy_partial(p, udp_buf + 10, p->tot_len, 0);
+   pbuf_free(p);
+   if (sendto(u->fd, udp_buf, 10u + n, 0, (struct sockaddr *)&u->client, sizeof(u->client)) < 0)
+      n_udp_drop++;
+   else
+      n_udp_in++;
+}
+
+/* title -> tunnel: everything waiting on the relay socket */
+static int tunnel_up(void);
+static void
+udp_from_title(struct uassoc *u)
+{
+   for (int k = 0; k < 256; k++) {
+      struct sockaddr_in from;
+      socklen_t fl = sizeof(from);
+      const ssize_t r = recvfrom(u->fd, udp_buf, sizeof(udp_buf), 0, (struct sockaddr *)&from, &fl);
+      if (r < 0)
+         return;
+      /* only the title on this console, and only plain IPv4 datagrams */
+      if (from.sin_addr.s_addr != htonl(INADDR_LOOPBACK) || r < 10 || udp_buf[2] != 0 || udp_buf[3] != 1) {
+         n_udp_drop++;
+         continue;
+      }
+      u->client = from;
+      u->have_client = 1;
+      if (!tunnel_up()) {
+         n_udp_drop++;
+         continue;
+      }
+      ip_addr_t ip;
+      uint32_t a;
+      memcpy(&a, udp_buf + 4, 4);
+      ip_addr_set_ip4_u32(&ip, a);
+      const u16_t port = (u16_t)((udp_buf[8] << 8) | udp_buf[9]);
+      struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, (u16_t)(r - 10), PBUF_RAM);
+      if (!p) {
+         n_udp_drop++;
+         continue;
+      }
+      memcpy(p->payload, udp_buf + 10, (size_t)(r - 10));
+      if (udp_sendto(u->pcb, p, &ip, port) == ERR_OK)
+         n_udp_out++;
+      else
+         n_udp_drop++;
+      pbuf_free(p);
+   }
+}
+
+/* A UDP ASSOCIATE request: the relay's port in the reply. */
+static void
+udp_associate(struct conn *c)
+{
+   int i = 0;
+   while (i < MAX_UDP && uas[i].used)
+      i++;
+   struct uassoc *u = i < MAX_UDP ? &uas[i] : NULL;
+   if (u) {
+      memset(u, 0, sizeof(*u));
+      u->used = 1;
+      u->fd = socket(AF_INET, SOCK_DGRAM, 0);
+      struct sockaddr_in la;
+      memset(&la, 0, sizeof(la));
+#if defined(__FreeBSD__) || defined(__PROSPERO__)
+      la.sin_len = sizeof(la);
+#endif
+      la.sin_family = AF_INET;
+      la.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      socklen_t ll = sizeof(la);
+      u->pcb = udp_new();
+      if (u->fd < 0 || bind(u->fd, (struct sockaddr *)&la, sizeof(la)) != 0 ||
+          getsockname(u->fd, (struct sockaddr *)&la, &ll) != 0 || !u->pcb ||
+          udp_bind(u->pcb, IP_ADDR_ANY, 0) != ERR_OK) {
+         warp_log("warp: UDP association failed (errno %d)", errno);
+         udp_assoc_free(i);
+         u = NULL;
+      } else {
+         int bufsz = 1 << 20;
+         setsockopt(u->fd, SOL_SOCKET, SO_RCVBUF, &bufsz, sizeof(bufsz));
+         setsockopt(u->fd, SOL_SOCKET, SO_SNDBUF, &bufsz, sizeof(bufsz));
+         set_nonblock(u->fd);
+         udp_recv(u->pcb, udp_from_tunnel, u);
+         c->udp = i + 1;
+         c->state = C_UDP;
+         n_udp_assoc++;
+         socks_reply_port(c, 0, htonl(INADDR_LOOPBACK), ntohs(la.sin_port));
+         return;
+      }
+   }
+   socks_reply(c, 1, 0);
+   conn_close(c);
+}
+
 /* A SOCKS greeting or request has arrived in c->in. */
 static void
 socks_step(struct conn *c)
@@ -508,6 +659,11 @@ socks_step(struct conn *c)
    }
    if (c->in_len < need)
       return;
+   if (cmd == 3) {
+      c->in_len = 0;
+      udp_associate(c);
+      return;
+   }
    c->resolve_only = cmd == 0xF0;
    if (cmd != 1 && cmd != 0xF0) {
       socks_reply(c, 7, 0);
@@ -803,6 +959,8 @@ setup(const char *conf_path, unsigned short port)
    set_nonblock(listen_fd);
    for (int i = 0; i < MAX_CONNS; i++)
       conns[i].fd = -1;
+   for (int i = 0; i < MAX_UDP; i++)
+      uas[i].fd = -1;
    warp_log("warp: gateway on 127.0.0.1:%u, tunnel %s -> %s:%u", port, conf.address_v4, conf.endpoint_ip,
             conf.endpoint_port);
    return 0;
@@ -811,8 +969,8 @@ setup(const char *conf_path, unsigned short port)
 static void
 loop_once(void)
 {
-   struct pollfd pf[MAX_CONNS + 2];
-   int map[MAX_CONNS + 2];
+   struct pollfd pf[MAX_CONNS + MAX_UDP + 2];
+   int map[MAX_CONNS + MAX_UDP + 2];
    int n = 0;
    pf[n].fd = rx_wake[0], pf[n].events = POLLIN, map[n++] = -1;
    pf[n].fd = listen_fd, pf[n].events = POLLIN, map[n++] = -2;
@@ -821,7 +979,7 @@ loop_once(void)
       if (c->state == C_FREE)
          continue;
       short ev = 0;
-      if (c->state == C_GREET || c->state == C_REQUEST)
+      if (c->state == C_GREET || c->state == C_REQUEST || c->state == C_UDP)
          ev |= POLLIN;
       if (c->state == C_OPEN && !c->local_eof && c->pcb && tcp_sndbuf(c->pcb) > 0)
          ev |= POLLIN;
@@ -829,6 +987,9 @@ loop_once(void)
          ev |= POLLOUT;
       pf[n].fd = c->fd, pf[n].events = ev, map[n++] = i;
    }
+   for (int i = 0; i < MAX_UDP; i++)
+      if (uas[i].used)
+         pf[n].fd = uas[i].fd, pf[n].events = POLLIN, map[n++] = -3 - i;
    u32_t wait = sys_timeouts_sleeptime();
    if (wait > 20)
       wait = 20;
@@ -837,7 +998,10 @@ loop_once(void)
    for (int k = 0; k < n; k++) {
       if (!pf[k].revents)
          continue;
-      if (map[k] == -1) {
+      if (map[k] <= -3) {
+         if (uas[-3 - map[k]].used)
+            udp_from_title(&uas[-3 - map[k]]);
+      } else if (map[k] == -1) {
          uplink_receive();
       } else if (map[k] == -2) {
          for (;;) {
@@ -876,6 +1040,12 @@ loop_once(void)
                }
                c->in_len += (size_t)r;
                socks_step(c);
+            } else if (c->state == C_UDP) {
+               /* the control connection: closing it ends the association */
+               uint8_t junk[64];
+               const ssize_t r = read(c->fd, junk, sizeof(junk));
+               if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK))
+                  conn_close(c);
             } else if (c->state == C_OPEN) {
                pump_local(c);
             } else if (pf[k].revents & (POLLHUP | POLLERR)) {
@@ -1019,10 +1189,12 @@ status(void)
    for (int i = 0; i < MAX_CONNS; i++)
       active += conns[i].state != C_FREE;
    warp_log("warp: tunnel %s, %d connections, %u opened, %u failed; %llu KiB in %llu packets out, %llu KiB in "
-            "%llu packets in; %llu send errors (last errno %d), %llu queue drops",
+            "%llu packets in; %llu send errors (last errno %d), %llu queue drops; game UDP: %llu associations, "
+            "%llu out, %llu in, %llu dropped",
             up ? "up" : "down", active, n_opened, n_failed, (unsigned long long)(up_tx >> 10),
             (unsigned long long)up_tx_pkts, (unsigned long long)(up_rx >> 10), (unsigned long long)up_rx_pkts,
-            (unsigned long long)up_tx_err, up_last_errno, (unsigned long long)rx_dropped);
+            (unsigned long long)up_tx_err, up_last_errno, (unsigned long long)rx_dropped, n_udp_assoc, n_udp_out,
+            n_udp_in, n_udp_drop);
 }
 
 int

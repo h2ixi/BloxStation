@@ -89,6 +89,10 @@ static struct {
    uint8_t used, tcp, via_gateway, nonblock; /* nonblock: emulated with MSG_DONTWAIT */
    uint32_t peer_addr; /* network order, as the engine connected to */
    uint16_t peer_port; /* network order */
+   /* UDP through the gateway (bn_udp_*): 1 tunnelled, 2 direct (refused) */
+   uint8_t udp_mode, udp_connected;
+   int udp_ctl;            /* the SOCKS control connection, kept open */
+   uint16_t udp_relay_port; /* network order, on 127.0.0.1 */
 } bn_fd[BN_FDS];
 
 
@@ -324,6 +328,8 @@ bn_name_for_addr(uint32_t addr /* network order */)
 }
 
 static unsigned bn_connects, bn_connect_fails;
+static int bn_udp_tunnel(int fd, uint32_t dst);
+static void bn_udp_relay_addr(int fd, struct sockaddr_in *r);
 
 static int
 bn_connect(int fd, const void *addr, socklen_t len)
@@ -335,6 +341,18 @@ bn_connect(int fd, const void *addr, socklen_t len)
       return -1;
    }
    const bool tcp = fd >= 0 && fd < BN_FDS && bn_fd[fd].used && bn_fd[fd].tcp;
+   if (!tcp && ss.ss_family == AF_INET &&
+       bn_udp_tunnel(fd, ((const struct sockaddr_in *)&ss)->sin_addr.s_addr)) {
+      /* the socket talks to the relay; the engine's peer is remembered */
+      struct sockaddr_in relay;
+      bn_udp_relay_addr(fd, &relay);
+      if (connect(fd, (struct sockaddr *)&relay, sizeof(relay)) != 0)
+         BN_FAIL(-1);
+      bn_fd[fd].peer_addr = ((const struct sockaddr_in *)&ss)->sin_addr.s_addr;
+      bn_fd[fd].peer_port = ((const struct sockaddr_in *)&ss)->sin_port;
+      bn_fd[fd].udp_connected = 1;
+      return 0;
+   }
    if (!tcp || ss.ss_family != AF_INET) {
       if (connect(fd, (struct sockaddr *)&ss, sl) != 0)
          BN_FAIL(-1);
@@ -401,6 +419,179 @@ bn_connect(int fd, const void *addr, socklen_t len)
    return 0;
 }
 
+/* ---- the game's UDP through the gateway --------------------------------
+ * Roblox's game servers speak UDP (RakNet). It used to go straight out of
+ * the PS5; some networks stopped answering it (Qatar, Nov 25: every join
+ * ended in error 279, "no response from server"). Now a UDP socket's first
+ * datagram to a public IPv4 address opens a SOCKS5 UDP association with
+ * the gateway (warp_gateway.c) and every datagram goes to its relay on
+ * 127.0.0.1 with the SOCKS5 UDP header; replies come back the same way and
+ * are unwrapped here, so the engine sees the real server. The socket stays
+ * the engine's own (poll/epoll unchanged). LAN and loopback stay direct;
+ * a gateway that refuses (the PC gateway) leaves the socket direct.
+ * ROBLOX_UDP_DIRECT=1 keeps all UDP direct. */
+static unsigned bn_udp_assocs, bn_udp_refused;
+static pthread_mutex_t bn_udp_lock = PTHREAD_MUTEX_INITIALIZER;
+static int bn_udp_associate(int fd);
+
+static int
+bn_udp_public(uint32_t a /* network order */)
+{
+   const uint32_t h = ntohl(a);
+   return !((h >> 24) == 0 || (h >> 24) == 10 || (h >> 24) == 127 || (h & 0xFFFF0000u) == 0xA9FE0000u ||
+            (h & 0xFFF00000u) == 0xAC100000u || (h & 0xFFFF0000u) == 0xC0A80000u || (h >> 28) >= 14);
+}
+
+/* 1: this datagram goes through the gateway (association made if needed) */
+static int
+bn_udp_tunnel(int fd, uint32_t dst /* network order */)
+{
+   if (fd < 0 || fd >= BN_FDS || !bn_fd[fd].used || bn_fd[fd].tcp || !bn_udp_public(dst))
+      return 0;
+   const uint8_t mode = __atomic_load_n(&bn_fd[fd].udp_mode, __ATOMIC_ACQUIRE);
+   if (mode)
+      return mode == 1;
+   /* one association per socket: a second thread sending meanwhile waits
+    * for it here instead of going out direct */
+   pthread_mutex_lock(&bn_udp_lock);
+   if (!bn_fd[fd].udp_mode)
+      __atomic_store_n(&bn_fd[fd].udp_mode, (uint8_t)(bn_udp_associate(fd) ? 1 : 2), __ATOMIC_RELEASE);
+   const int tunnelled = bn_fd[fd].udp_mode == 1;
+   pthread_mutex_unlock(&bn_udp_lock);
+   return tunnelled;
+}
+
+/* the SOCKS5 UDP ASSOCIATE handshake for fd; 1 when it worked */
+static int
+bn_udp_associate(int fd)
+{
+   static int direct = -1;
+   if (direct < 0)
+      direct = getenv("ROBLOX_UDP_DIRECT") != NULL;
+   if (direct)
+      return 0;
+   struct sockaddr_in gw;
+   if (bn_gateway_addr(&gw) != 0)
+      return 0;
+   const int c = socket(AF_INET, SOCK_STREAM, 0);
+   if (c < 0)
+      return 0;
+   int one = 1;
+   setsockopt(c, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+   struct timeval tv = {10, 0};
+   setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+   setsockopt(c, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+   uint8_t rep[10];
+   static const uint8_t req[10] = {5, 3, 0, 1, 0, 0, 0, 0, 0, 0}; /* UDP ASSOCIATE 0.0.0.0:0 */
+   int ok = connect(c, (struct sockaddr *)&gw, sizeof(gw)) == 0 && bn_io_all(c, (uint8_t[]){5, 1, 0}, 3, 1) == 0 &&
+            bn_io_all(c, rep, 2, 0) == 0 && rep[0] == 5 && rep[1] == 0 && bn_io_all(c, (void *)req, 10, 1) == 0 &&
+            bn_io_all(c, rep, 10, 0) == 0 && rep[1] == 0 && rep[3] == 1;
+   if (!ok) {
+      close(c);
+      const unsigned k = __atomic_add_fetch(&bn_udp_refused, 1, __ATOMIC_RELAXED);
+      if (k <= 4)
+         bionic_say("net: UDP socket %d: the gateway has no UDP relay; this socket stays direct", fd);
+      return 0;
+   }
+   bn_fd[fd].udp_ctl = c;
+   memcpy(&bn_fd[fd].udp_relay_port, rep + 8, 2);
+   const unsigned k = __atomic_add_fetch(&bn_udp_assocs, 1, __ATOMIC_RELAXED);
+   if (k <= 20)
+      bionic_say("net: UDP socket %d: game traffic through the tunnel (relay port %u)", fd,
+                 ntohs(bn_fd[fd].udp_relay_port));
+   return 1;
+}
+
+static void
+bn_udp_relay_addr(int fd, struct sockaddr_in *r)
+{
+   memset(r, 0, sizeof(*r));
+   r->sin_len = sizeof(*r);
+   r->sin_family = AF_INET;
+   r->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   r->sin_port = bn_fd[fd].udp_relay_port;
+}
+
+/* one datagram to dst through the relay */
+static ssize_t
+bn_udp_send(int fd, const struct iovec *iov, size_t iovcnt, uint32_t dst, uint16_t port, int flags)
+{
+   size_t total = 0;
+   for (size_t i = 0; i < iovcnt; i++)
+      total += iov[i].iov_len;
+   uint8_t stack[2048];
+   uint8_t *b = total + 10 <= sizeof(stack) ? stack : malloc(total + 10);
+   if (!b) {
+      errno = ENOBUFS;
+      return -1;
+   }
+   b[0] = b[1] = b[2] = 0;
+   b[3] = 1;
+   memcpy(b + 4, &dst, 4);
+   memcpy(b + 8, &port, 2);
+   size_t at = 10;
+   for (size_t i = 0; i < iovcnt; i++) {
+      memcpy(b + at, iov[i].iov_base, iov[i].iov_len);
+      at += iov[i].iov_len;
+   }
+   ssize_t r;
+   if (bn_fd[fd].udp_connected) {
+      r = send(fd, b, at, flags);
+   } else {
+      struct sockaddr_in relay;
+      bn_udp_relay_addr(fd, &relay);
+      r = sendto(fd, b, at, flags, (struct sockaddr *)&relay, sizeof(relay));
+   }
+   if (b != stack)
+      free(b);
+   return r < 0 ? -1 : (ssize_t)total;
+}
+
+/* one datagram from a tunnelled socket: unwrapped into iov, src and sport
+ * the real sender. Datagrams that did not come from the relay are passed
+ * through as they are. */
+static ssize_t
+bn_udp_recv(int fd, const struct iovec *iov, size_t iovcnt, int flags, uint32_t *src, uint16_t *sport, int *trunc)
+{
+   size_t room = 0;
+   for (size_t i = 0; i < iovcnt; i++)
+      room += iov[i].iov_len;
+   uint8_t stack[2048];
+   const size_t cap = room + 10 <= sizeof(stack) ? sizeof(stack) : room + 10;
+   uint8_t *b = cap == sizeof(stack) ? stack : malloc(cap);
+   if (!b) {
+      errno = ENOBUFS;
+      return -1;
+   }
+   struct sockaddr_in from;
+   socklen_t fl = sizeof(from);
+   ssize_t r = recvfrom(fd, b, cap, flags, (struct sockaddr *)&from, &fl);
+   if (r < 0) {
+      if (b != stack)
+         free(b);
+      return -1;
+   }
+   size_t off = 0;
+   *src = from.sin_addr.s_addr;
+   *sport = from.sin_port;
+   if (from.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && from.sin_port == bn_fd[fd].udp_relay_port && r >= 10 &&
+       b[3] == 1) {
+      memcpy(src, b + 4, 4);
+      memcpy(sport, b + 8, 2);
+      off = 10;
+   }
+   size_t n = (size_t)r - off, done = 0;
+   *trunc = n > room;
+   for (size_t i = 0; i < iovcnt && done < n; i++) {
+      const size_t k = n - done < iov[i].iov_len ? n - done : iov[i].iov_len;
+      memcpy(iov[i].iov_base, b + off + done, k);
+      done += k;
+   }
+   if (b != stack)
+      free(b);
+   return (ssize_t)done;
+}
+
 static int bn_bind(int fd, const void *a, socklen_t l)
 {
    struct sockaddr_storage ss;
@@ -418,12 +609,28 @@ static ssize_t
 bn_sendto(int fd, const void *b, size_t n, int lf, const void *a, socklen_t l)
 {
    ssize_t r;
+   if (bn_is_socket(fd) && bn_fd[fd].udp_connected && (!a || !l)) {
+      const struct iovec v = {(void *)b, n};
+      r = bn_udp_send(fd, &v, 1, bn_fd[fd].peer_addr, bn_fd[fd].peer_port,
+                      bn_msg_flags(lf) | MSG_NOSIGNAL | bn_dontwait(fd));
+      if (r < 0)
+         BN_FAIL(-1);
+      return r;
+   }
    if (a && l) {
       struct sockaddr_storage ss;
       socklen_t sl;
       if (bn_to_bsd(a, l, &ss, &sl) != 0) {
          errno = 97;
          return -1;
+      }
+      if (ss.ss_family == AF_INET && bn_udp_tunnel(fd, ((struct sockaddr_in *)&ss)->sin_addr.s_addr)) {
+         const struct iovec v = {(void *)b, n};
+         r = bn_udp_send(fd, &v, 1, ((struct sockaddr_in *)&ss)->sin_addr.s_addr, ((struct sockaddr_in *)&ss)->sin_port,
+                         bn_msg_flags(lf) | MSG_NOSIGNAL | bn_dontwait(fd));
+         if (r < 0)
+            BN_FAIL(-1);
+         return r;
       }
       r = sendto(fd, b, n, bn_msg_flags(lf) | MSG_NOSIGNAL | bn_dontwait(fd), (struct sockaddr *)&ss, sl);
    } else {
@@ -441,6 +648,23 @@ static ssize_t bn_sendto_chk(int fd, const void *b, size_t n, size_t bn, int lf,
 static ssize_t
 bn_recvfrom(int fd, void *b, size_t n, int lf, void *a, socklen_t *l)
 {
+   if (bn_is_socket(fd) && bn_fd[fd].udp_mode == 1) {
+      const struct iovec v = {b, n};
+      uint32_t src;
+      uint16_t sport;
+      int trunc;
+      const ssize_t r = bn_udp_recv(fd, &v, 1, bn_msg_flags(lf) | bn_dontwait(fd), &src, &sport, &trunc);
+      if (r < 0)
+         BN_FAIL(-1);
+      if (a && l) {
+         uint8_t lin[16] = {2, 0};
+         memcpy(lin + 2, &sport, 2);
+         memcpy(lin + 4, &src, 4);
+         memcpy(a, lin, *l < 16 ? *l : 16);
+         *l = 16;
+      }
+      return r;
+   }
    struct sockaddr_storage ss;
    socklen_t sl = sizeof(ss);
    const ssize_t r = recvfrom(fd, b, n, bn_msg_flags(lf) | bn_dontwait(fd), a ? (struct sockaddr *)&ss : NULL, a ? &sl : NULL);
@@ -480,6 +704,23 @@ bn_sendmsg(int fd, const struct bn_msghdr *m, int lf)
       errno = 97;
       return -1;
    }
+   if (bn_is_socket(fd) && !bn_fd[fd].tcp) {
+      uint32_t dst = 0;
+      uint16_t port = 0;
+      int tunnel = 0;
+      if (sl && ss.ss_family == AF_INET) {
+         dst = ((struct sockaddr_in *)&ss)->sin_addr.s_addr, port = ((struct sockaddr_in *)&ss)->sin_port;
+         tunnel = bn_udp_tunnel(fd, dst);
+      } else if (!sl && bn_fd[fd].udp_connected) {
+         dst = bn_fd[fd].peer_addr, port = bn_fd[fd].peer_port, tunnel = 1;
+      }
+      if (tunnel) {
+         const ssize_t r = bn_udp_send(fd, m->iov, m->iovlen, dst, port, bn_msg_flags(lf) | MSG_NOSIGNAL | bn_dontwait(fd));
+         if (r < 0)
+            BN_FAIL(-1);
+         return r;
+      }
+   }
    struct msghdr h;
    memset(&h, 0, sizeof(h));
    h.msg_name = sl ? &ss : NULL;
@@ -494,6 +735,24 @@ bn_sendmsg(int fd, const struct bn_msghdr *m, int lf)
 static ssize_t
 bn_recvmsg(int fd, struct bn_msghdr *m, int lf)
 {
+   if (bn_is_socket(fd) && bn_fd[fd].udp_mode == 1) {
+      uint32_t src;
+      uint16_t sport;
+      int trunc;
+      const ssize_t r = bn_udp_recv(fd, m->iov, m->iovlen, bn_msg_flags(lf) | bn_dontwait(fd), &src, &sport, &trunc);
+      if (r < 0)
+         BN_FAIL(-1);
+      if (m->name) {
+         uint8_t lin[16] = {2, 0};
+         memcpy(lin + 2, &sport, 2);
+         memcpy(lin + 4, &src, 4);
+         memcpy(m->name, lin, m->namelen < 16 ? m->namelen : 16);
+         m->namelen = 16;
+      }
+      m->controllen = 0;
+      m->flags = trunc ? 0x20 : 0; /* Linux MSG_TRUNC */
+      return r;
+   }
    struct sockaddr_storage ss;
    struct msghdr h;
    memset(&h, 0, sizeof(h));
@@ -653,7 +912,7 @@ bn_getsockname(int fd, void *a, socklen_t *l)
 static int
 bn_getpeername(int fd, void *a, socklen_t *l)
 {
-   if (fd >= 0 && fd < BN_FDS && bn_fd[fd].via_gateway) {
+   if (fd >= 0 && fd < BN_FDS && (bn_fd[fd].via_gateway || bn_fd[fd].udp_connected)) {
       uint8_t lin[16] = {2, 0};
       memcpy(lin + 2, &bn_fd[fd].peer_port, 2);
       memcpy(lin + 4, &bn_fd[fd].peer_addr, 4);
@@ -980,6 +1239,11 @@ bn_forget(int fd)
    if (fd >= 0 && fd < BN_FDS && bn_fd[fd].used)
       BN_T("close(%d) of a socket", fd);
    if (fd >= 0 && fd < BN_FDS) {
+      if (bn_fd[fd].udp_mode == 1 && bn_fd[fd].udp_ctl > 0)
+         close(bn_fd[fd].udp_ctl); /* ends the association */
+      bn_fd[fd].udp_mode = 0;
+      bn_fd[fd].udp_connected = 0;
+      bn_fd[fd].udp_ctl = 0;
       bn_fd[fd].used = 0;
       bn_fd[fd].via_gateway = 0;
       if (bn_epolls[fd]) {

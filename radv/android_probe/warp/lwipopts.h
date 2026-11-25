@@ -1,5 +1,5 @@
-/* lwIP settings for the in-title WARP gateway: one thread (NO_SYS), TCP and
- * DNS only, inside a WireGuard tunnel with a 1280-byte MTU. The 1 MiB
+/* lwIP settings for the in-title WARP gateway: one thread (NO_SYS), TCP, DNS
+ * and the game's UDP, inside a WireGuard tunnel with a 1280-byte MTU. The 1 MiB
  * receive window keeps a connection fast over the ~80 ms round trip to
  * Cloudflare (128 KiB gave 1.3 MB/s); buffers are sized to match. */
 #ifndef WARP_LWIPOPTS_H
@@ -33,7 +33,7 @@
 #define MEMP_NUM_TCP_PCB 256
 #define MEMP_NUM_TCP_PCB_LISTEN 4
 #define MEMP_NUM_TCP_SEG 16384
-#define MEMP_NUM_UDP_PCB 8
+#define MEMP_NUM_UDP_PCB 80 /* 64 game associations (warp_gateway.c MAX_UDP) + DNS */
 #define MEMP_NUM_SYS_TIMEOUT 32
 #define MEMP_NUM_REASSDATA 16
 #define IP_REASS_MAX_PBUFS 64
