@@ -1,0 +1,19 @@
+# build outputs and downloaded dependencies
+/build/
+/dist/
+/.deps/
+__pycache__/
+*.pyc
+
+# never commit: console data, sign-in, tunnel keys, Roblox app files
+radv-smoke.txt
+radv-smoke-env.txt
+session.txt
+accountblob*
+warp.json
+warp-*.json
+warp-endpoint.txt
+*.apk
+libroblox.so
+/assets/
+runtime/libc.prx

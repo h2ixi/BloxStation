@@ -1,0 +1,25 @@
+BloxStation - install
+=====================
+
+This zip has the title only. Roblox's own files are NOT included: take them
+from the Roblox Android app (x86_64 APK), version 2.746.1266 exactly. The
+title patches that version in memory; other versions will not start.
+
+1. Copy the PPSA99187 folder to /data/homebrew/PPSA99187/ on the PS5
+   (FTP or a USB drive). It already has radv-smoke-env.txt; keep it as is
+   (ROBLOX_OPENAT_TEST=1 in it is required, or games disconnect after about
+   a minute).
+2. From the APK (it is a zip file), copy:
+     lib/x86_64/libroblox.so  ->  /data/homebrew/PPSA99187/libroblox.so
+     assets/                  ->  /data/homebrew/PPSA99187/assets/
+3. Optional, the Guide item in the left menu: on a PC with Python 3.14 and
+   the source code, run
+     tools/patch-guide-menu.sh assets/ExtraContent/models/UniversalApp/UniversalApp.rbxm out
+   and copy out/UniversalApp.rbxm and out/UniversalApp_checksum into
+   assets/ExtraContent/models/UniversalApp/ on the console. The guide still
+   opens by itself for every new player without this.
+4. Wait for ShadowMount+ to register the title (about 45 s), then start
+   BloxStation from the home screen and sign in.
+
+Your sign-in and the tunnel key are created on and stay on your PS5
+(/data/roblox/files/). Never share that folder.

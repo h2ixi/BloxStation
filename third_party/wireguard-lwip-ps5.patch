@@ -1,0 +1,27 @@
+diff --git a/src/wireguardif.c b/src/wireguardif.c
+index 03627de..78cc24a 100644
+--- a/src/wireguardif.c
++++ b/src/wireguardif.c
+@@ -31,6 +31,8 @@
+  */
+ 
+ #include "wireguardif.h"
++/* ps5-vulkan: encrypted packets leave through the host's own UDP socket */
++err_t wg_uplink_sendto(struct pbuf *p, const ip_addr_t *ip, u16_t port);
+ 
+ #include <string.h>
+ #include <stdlib.h>
+@@ -80,11 +82,11 @@ static err_t wireguardif_peer_output(struct netif *netif, struct pbuf *q, struct
+ 	struct wireguard_device *device = (struct wireguard_device *)netif->state;
+ 	// Send to last know port, not the connect port
+ 	//TODO: Support DSCP and ECN - lwip requires this set on PCB globally, not per packet
+-	return udp_sendto(device->udp_pcb, q, &peer->ip, peer->port);
++	return wg_uplink_sendto(q, &peer->ip, peer->port); /* ps5-vulkan: host UDP socket */
+ }
+ 
+ static err_t wireguardif_device_output(struct wireguard_device *device, struct pbuf *q, const ip4_addr_t *ipaddr, u16_t port) {
+-	return udp_sendto(device->udp_pcb, q, ipaddr, port);
++	return wg_uplink_sendto(q, ipaddr, port); /* ps5-vulkan: host UDP socket */
+ }
+ 
+ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, const ip4_addr_t *ipaddr, struct wireguard_peer *peer) {
